@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 "use client";
 
 import "@/app/styles/Call.css";
@@ -60,12 +61,15 @@ const STATUS_CONFIG: Record<CallStatus, { label: string; color: string }> = {
 //bloquear el botón llamar hasta que el usuario haga reset
 const BUSY_STATUSES: CallStatus[] = ["generating", "connecting", "ringing", "inCall", "ended"];
 
+//no bloquear el botón reset de colgar si esta en uno de estos estados
+const BUSY_HANG: CallStatus[] = [ "inCall", "connecting", "ringing"];
+
 // ── Hold Music ────────────────────────────────────────────────────────────────
 const HOLD_MUSIC_OPTIONS = [
     { label: "🎵 Melodía Suave", url: "https://dl.espressif.com/dl/audio/ff-16b-2c-44100hz.mp3" },
     { label: "🎸 Ritmo Ligero", url: "https://dl.espressif.com/dl/audio/ff-16b-2c-22050hz.mp3" },
     { label: "🎺 Ambiente Tranquilo", url: "https://dl.espressif.com/dl/audio/ff-16b-2c-16000hz.mp3" },
-    { label: "🎹 Interludio Breve", url: "https://dl.espressif.com/dl/audio/gs-16b-2c-44100hz.mp3" },
+    // { label: "🎹 Interludio Breve", url: "https://dl.espressif.com/dl/audio/gs-16b-2c-44100hz.mp3" },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -101,6 +105,9 @@ export default function CallPage({ initialToken }: Props) {
 
     const isInCall = status === "inCall";
     const showControls = isInCall;
+
+
+    // ── Init ──────────────────────────────────────────────────────────────────
 
 
     useEffect(() => {
@@ -240,7 +247,6 @@ export default function CallPage({ initialToken }: Props) {
     // ── Callink API ───────────────────────────────────────────────────────────
 
     const initializeCallink = async (token: string) => {
-        if (!token) return;
         await callinkRef.current?.dispose?.();
         callinkRef.current = null;
         wasInCallRef.current = false;
@@ -259,17 +265,17 @@ export default function CallPage({ initialToken }: Props) {
                 onConnected: () => {
                     setStatus("connected");
                 },
-                // Se dispara cuando ambos participantes se han conectado y la llamada está activa
-                onOpen: () => {
-                    stopRinging(); // ← ambos conectados, detener tono
-                    setStatus("inCall");
-                },
-                // Se dispara cuando el emisor llama y espera que el receptor conteste
+                 // Se dispara cuando alguno se une a la llamada y espera que el otro se una
                 onRinging: () => {
                     setStatus("ringing");
                     startRinging();
                 },
-                // Se dispara cuando alguno  contesta y se activa el stream de audio
+                // Se dispara cuando ambos participantes se han unido a la llamada y está activa
+                onOpen: () => {
+                    stopRinging(); //ambos conectados, detener tono
+                    setStatus("inCall");
+                },
+                // Se dispara cuando alguno contesta y se activa el stream de audio
                 onStream: (stream: MediaStream) => {
                     wasInCallRef.current = true;
                     setStatus("inCall");
@@ -283,22 +289,23 @@ export default function CallPage({ initialToken }: Props) {
                         audioRef.current.play().catch(console.error);
                     }
                 },
-                // Se dispara cuando la llamada termina por cualquier motivo (colgado, error, sin respuesta, etc.)
+                // Se dispara cuando estas conectado pero no en llamada y la seccion expira (sin respuesta)
                 onDisconnected: () => {
                     if (!wasInCallRef.current) return;
                     wasInCallRef.current = false;
                     setStatus("ended");
-                    showToast("El otro participante colgó", "warning", "📴");
+                    showToast("La sesión ha expirado", "warning", "⌛");
                     cleanupAudio();
                 },
-                // Se dispara cuando la llamada termina por el emisor o receptor (colgado, error, sin respuesta, etc.)
+                // Se dispara cuando la llamada se termina por uno de los participantes(al colgar,cerrar navegador,perder conexión, etc)
                 onClosed: () => {
                     if (!wasInCallRef.current) return;
                     wasInCallRef.current = false;
                     setStatus("ended");
+                     showToast("El otro participante colgó", "warning", "📴");
                     cleanupAudio();
                 },
-                //se dispara cuando alguno de los participantes no responde a la llamada
+                //se dispara cuando alguno se une a la llamada pero el otro no y expira el tiempo de espera
                 onNoAnswer: () => {
                     stopRinging();
                     wasInCallRef.current = false;
@@ -320,11 +327,11 @@ export default function CallPage({ initialToken }: Props) {
             const response = await createLink();
             const token = response?.token;
             if (!token) throw new Error("Token inválido");
-            const link = `${window.location.origin}/${token}`;
+            const link = `${window.location.origin}/outbounds/call/${token}`;
             setGeneratedToken(token);
             setGeneratedLink(link);
             await initializeCallink(token);
-          //  showToast("Enlace creado. ¡Compártelo!", "success", "🔗");
+            //  showToast("Enlace creado. ¡Compártelo!", "success", "🔗");
         } catch {
             setStatus("error");
             showToast("Error generando el enlace", "error", "❌");
@@ -350,7 +357,11 @@ export default function CallPage({ initialToken }: Props) {
     // Tanto el emisor como el receptor pueden iniciar la llamada (el emisor después de generar el enlace, el receptor después de conectarse)
     const handleStartCall = async () => {
         const token = initialToken || generatedToken;
-        if (!token) { showToast("No hay token disponible", "warning", "⚠️"); return; }
+
+        if (!token) {
+            showToast("No hay token disponible", "warning", "⚠️");
+            return;
+        }
 
         if (!callinkRef.current) {
             showToast("Aún conectando, intenta de nuevo", "warning", "⚠️");
@@ -358,13 +369,44 @@ export default function CallPage({ initialToken }: Props) {
         }
 
         try {
-            const hasActive = await callinkRef.current?.callService?.HasActiveCall?.();
-            if (hasActive) { showToast("Ya hay una llamada activa", "info", "📞"); return; }
-        } catch (_) { }
 
-        await callinkRef.current.Call(clientID, token);
-        showToast(isReceiver?"Te uniste a la llamada": "Llamando...", "info", "📲");
+            // const hasActive = await callinkRef.current?.callService?.HasActiveCall?.();
+            // if (hasActive) {
+            //     showToast("Ya hay una llamada activa", "info", "📞");
+            //     return;
+            // }
+
+            await callinkRef.current.Call(clientID, token);
+            showToast(
+                isReceiver ? "Te uniste a la llamada" : "Llamando...",
+                "info",
+                "📲"
+            );
+
+        } catch (error: any) {
+
+            //Usuario denegó el micrófono
+            if (error?.name === "NotAllowedError") {
+                showToast(
+                    "Debes permitir el micrófono para realizar la llamada",
+                    "error",
+                    "🎤"
+                );
+                return;
+            }
+
+            // No hay micrófono disponible
+            if (error?.name === "NotFoundError") {
+                showToast(
+                    "No se detectó ningún micrófono en el dispositivo",
+                    "error",
+                    "🎤"
+                );
+                return;
+            }
+        }
     };
+
 
     // Colgar la llamada
     const handleHangUp = async () => {
@@ -493,7 +535,7 @@ export default function CallPage({ initialToken }: Props) {
                             )}
 
                             <Chip
-                                label={"call"}
+                                label={isReceiver ? "Receptor" : "Emisor"}
                                 size="small"
                                 className="chip-sender"
                                 sx={{
@@ -791,16 +833,20 @@ export default function CallPage({ initialToken }: Props) {
                                 <span>
                                     <IconButton
                                         onClick={handleHangUp}
-                                        disabled={!["connected", "inCall", "connecting", "ringing"].includes(status)}
+                                        disabled={!BUSY_HANG.includes(status)}
                                         className="!text-white !rounded-full !flex-shrink-0 !w-[46px] !h-[46px]"
                                         sx={{
                                             background: "linear-gradient(135deg,#dc2626,#b91c1c)",
                                             boxShadow: "0 4px 20px rgba(220,38,38,.35)",
-                                            "&:hover": { background: "linear-gradient(135deg,#dc2626,#b91c1c)", 
-                                                         boxShadow: "0 6px 28px rgba(220,38,38,.5)",},
-                                            "&.Mui-disabled": { opacity: 0.4, 
-                                                                background: "linear-gradient(135deg,#dc2626,#b91c1c)", 
-                                                                color: "white" },
+                                            "&:hover": {
+                                                background: "linear-gradient(135deg,#dc2626,#b91c1c)",
+                                                boxShadow: "0 6px 28px rgba(220,38,38,.5)",
+                                            },
+                                            "&.Mui-disabled": {
+                                                opacity: 0.4,
+                                                background: "linear-gradient(135deg,#dc2626,#b91c1c)",
+                                                color: "white"
+                                            },
                                         }}
                                     >
                                         <CallEndIcon fontSize="small" />
