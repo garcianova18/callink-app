@@ -76,13 +76,15 @@ export default function CallPage({ initialToken }: Props) {
     // refs
     const callinkRef = useRef<any>(null);
     const audioRef = useRef<HTMLAudioElement | null>(null);
-    const ringAudioRef = useRef<HTMLAudioElement | null>(null); // audio de tono de llamada
+    const ringAudioRef = useRef<HTMLAudioElement | null>(null);
     const analyserRef = useRef<AnalyserNode | null>(null);
     const animRef = useRef<number | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const waveAnimRef = useRef<number | null>(null);
     const durationRef = useRef<NodeJS.Timeout | null>(null);
     const wasInCallRef = useRef(false);
+    // FIX 3: ref para controlar el timeout de onDisconnected
+    const disconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
 
     // state
     const [generatedToken, setGeneratedToken] = useState("");
@@ -102,7 +104,6 @@ export default function CallPage({ initialToken }: Props) {
     const isInCall = status === "inCall";
     const showControls = isInCall;
 
-
     useEffect(() => {
         if (status !== "inCall") {
             setIsMuted(false);
@@ -117,10 +118,11 @@ export default function CallPage({ initialToken }: Props) {
         }
     }, []);
 
-    // Limpieza al desmontar
+    // FIX 1: Limpieza correcta al desmontar — usar Destroy() en lugar de dispose()
     useEffect(() => {
         return () => {
-            callinkRef.current?.dispose?.();
+            if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+            callinkRef.current?.Destroy?.();
             callinkRef.current = null;
         };
     }, []);
@@ -241,11 +243,27 @@ export default function CallPage({ initialToken }: Props) {
 
     const initializeCallink = async (token: string) => {
         if (!token) return;
-        await callinkRef.current?.dispose?.();
+
+        // FIX 2: Solicitar micrófono anticipadamente antes de cualquier negociación SDP.
+        // En dispositivos móviles el popup de permisos puede tardar varios segundos,
+        // lo que causaba que el intercambio SDP expirara antes de completarse.
+        try {
+            const existingStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // Liberar las pistas inmediatamente; la librería las pedirá de nuevo internamente.
+            existingStream.getTracks().forEach(t => t.stop());
+        } catch {
+            showToast("Se necesita acceso al micrófono para llamar", "error", "🎤");
+            setStatus("error");
+            return;
+        }
+
+        // FIX 1: Usar Destroy() en lugar de dispose() que no existe en la librería.
+        // Sin esto, la instancia anterior quedaba viva con su WebSocket abierto,
+        // causando mensajes duplicados al servidor de señalización.
+        await callinkRef.current?.Destroy?.();
         callinkRef.current = null;
         wasInCallRef.current = false;
         setStatus("connecting");
-        //showToast("Conectando al servidor...", "info", "🔗");
 
         callinkRef.current = new Callink({
             SignalingWebsocketURL: "wss://callink-signaling-0-dev.sendiu.net",
@@ -255,27 +273,22 @@ export default function CallPage({ initialToken }: Props) {
             Keycloak: undefined,
             TenantId: undefined,
             Callbacks: {
-                // Se dispara cuando se establece la conexión con el servidor, pero antes de iniciar cualquier llamada
                 onConnected: () => {
                     setStatus("connected");
                 },
-                // Se dispara cuando ambos participantes se han conectado y la llamada está activa
                 onOpen: () => {
-                    stopRinging(); // ← ambos conectados, detener tono
+                    stopRinging();
                     setStatus("inCall");
                 },
-                // Se dispara cuando el emisor llama y espera que el receptor conteste
                 onRinging: () => {
                     setStatus("ringing");
                     startRinging();
                 },
-                // Se dispara cuando alguno  contesta y se activa el stream de audio
                 onStream: (stream: MediaStream) => {
                     wasInCallRef.current = true;
                     setStatus("inCall");
                     startAudioAnalysis(stream);
                 },
-                // Se dispara cada vez que llega una nueva pista de audio (puede ser varias veces por cambios en la conexión)
                 onTrack: (event: RTCTrackEvent) => {
                     if (event.track.kind !== "audio") return;
                     if (audioRef.current) {
@@ -283,23 +296,32 @@ export default function CallPage({ initialToken }: Props) {
                         audioRef.current.play().catch(console.error);
                     }
                 },
-                // Se dispara cuando la llamada termina por cualquier motivo (colgado, error, sin respuesta, etc.)
+                // FIX 3: onDisconnected se dispara también durante reconexión automática
+                // del WebSocket (no solo cuando el otro cuelga). Se agrega un delay de 4s
+                // para dar tiempo a la reconexión antes de declarar la llamada terminada.
                 onDisconnected: () => {
                     if (!wasInCallRef.current) return;
-                    wasInCallRef.current = false;
-                    setStatus("ended");
-                    showToast("El otro participante colgó", "warning", "📴");
-                    cleanupAudio();
+                    if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+                    disconnectTimerRef.current = setTimeout(() => {
+                        // Si la librería reconectó y la llamada sigue activa, no terminar
+                        if (callinkRef.current?.callService?.HasActiveCall?.()) return;
+                        if (!wasInCallRef.current) return;
+                        wasInCallRef.current = false;
+                        setStatus("ended");
+                        showToast("El otro participante colgó", "warning", "📴");
+                        cleanupAudio();
+                    }, 4000);
                 },
-                // Se dispara cuando la llamada termina por el emisor o receptor (colgado, error, sin respuesta, etc.)
                 onClosed: () => {
+                    // onClosed es el cuelgue real — cancelar el timer de onDisconnected
+                    if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
                     if (!wasInCallRef.current) return;
                     wasInCallRef.current = false;
                     setStatus("ended");
                     cleanupAudio();
                 },
-                //se dispara cuando alguno de los participantes no responde a la llamada
                 onNoAnswer: () => {
+                    if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
                     stopRinging();
                     wasInCallRef.current = false;
                     setStatus("ended");
@@ -312,7 +334,6 @@ export default function CallPage({ initialToken }: Props) {
 
     // ── Actions ───────────────────────────────────────────────────────────────
 
-    // El emisor genera un nuevo enlace y token al hacer click (el receptor ya tiene el token en la URL)
     const handleCreateCallLink = async () => {
         try {
             setStatus("generating");
@@ -324,17 +345,17 @@ export default function CallPage({ initialToken }: Props) {
             setGeneratedToken(token);
             setGeneratedLink(link);
             await initializeCallink(token);
-          //  showToast("Enlace creado. ¡Compártelo!", "success", "🔗");
         } catch {
             setStatus("error");
             showToast("Error generando el enlace", "error", "❌");
         }
     };
 
-    // El emisor puede resetear todo para generar un nuevo enlace, el receptor tendría que recargar la página con un nuevo token
     const handleReset = async () => {
         setIsResetting(true);
-        await callinkRef.current?.dispose?.();
+        if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+        // FIX 1: Usar Destroy() en lugar de dispose()
+        await callinkRef.current?.Destroy?.();
         callinkRef.current = null;
         wasInCallRef.current = false;
         cleanupAudio();
@@ -347,7 +368,6 @@ export default function CallPage({ initialToken }: Props) {
         setIsResetting(false);
     };
 
-    // Tanto el emisor como el receptor pueden iniciar la llamada (el emisor después de generar el enlace, el receptor después de conectarse)
     const handleStartCall = async () => {
         const token = initialToken || generatedToken;
         if (!token) { showToast("No hay token disponible", "warning", "⚠️"); return; }
@@ -363,23 +383,23 @@ export default function CallPage({ initialToken }: Props) {
         } catch (_) { }
 
         await callinkRef.current.Call(clientID, token);
-        showToast(isReceiver?"Te uniste a la llamada": "Llamando...", "info", "📲");
+        showToast(isReceiver ? "Te uniste a la llamada" : "Llamando...", "info", "📲");
     };
 
-    // Colgar la llamada
     const handleHangUp = async () => {
         if (!callinkRef.current) return;
-        stopRinging(); // detiene el tono si se cuelga mientras llama
+        if (disconnectTimerRef.current) clearTimeout(disconnectTimerRef.current);
+        stopRinging();
         wasInCallRef.current = false;
         try { await callinkRef.current.HangUp(); } catch (_) { }
-        await callinkRef.current?.dispose?.();
+        // FIX 1: Usar Destroy() en lugar de dispose()
+        await callinkRef.current?.Destroy?.();
         callinkRef.current = null;
         setStatus("ended");
         showToast("Llamada finalizada", "info", "👋");
         cleanupAudio();
     };
 
-    // Silenciarse el microfono, lo que también reproduce música de espera para el otro participante
     const handleToggleMute = () => {
         if (!callinkRef.current) return;
         if (isMuted) {
@@ -395,7 +415,6 @@ export default function CallPage({ initialToken }: Props) {
         }
     };
 
-    // Grabar la llamada
     const handleToggleRecord = () => {
         if (!callinkRef.current) return;
         if (isRecording) {
@@ -409,7 +428,6 @@ export default function CallPage({ initialToken }: Props) {
         }
     };
 
-    // Copiar al portapapeles
     const copyToClipboard = async (text: string) => {
         await navigator.clipboard.writeText(text);
         setCopied("link");
@@ -428,7 +446,7 @@ export default function CallPage({ initialToken }: Props) {
             {/* Audio de la llamada */}
             <audio ref={audioRef} autoPlay playsInline className="hidden" />
 
-            {/* Audio del tono de llamada — solo suena localmente para el emisor */}
+            {/* Audio del tono de llamada */}
             <audio
                 ref={ringAudioRef}
                 src="https://dl.espressif.com/dl/audio/gs-16b-2c-44100hz.mp3"
@@ -645,7 +663,6 @@ export default function CallPage({ initialToken }: Props) {
                                     </Button>
                                 )}
 
-                                {/* Share row — oculto en ended para no mostrar enlace obsoleto */}
                                 {generatedToken && status !== "ended" && (
                                     <div className="flex flex-col gap-3">
                                         <span className="text-[0.72rem] font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">
@@ -796,10 +813,10 @@ export default function CallPage({ initialToken }: Props) {
                                         sx={{
                                             background: "linear-gradient(135deg,#dc2626,#b91c1c)",
                                             boxShadow: "0 4px 20px rgba(220,38,38,.35)",
-                                            "&:hover": { background: "linear-gradient(135deg,#dc2626,#b91c1c)", 
+                                            "&:hover": { background: "linear-gradient(135deg,#dc2626,#b91c1c)",
                                                          boxShadow: "0 6px 28px rgba(220,38,38,.5)",},
-                                            "&.Mui-disabled": { opacity: 0.4, 
-                                                                background: "linear-gradient(135deg,#dc2626,#b91c1c)", 
+                                            "&.Mui-disabled": { opacity: 0.4,
+                                                                background: "linear-gradient(135deg,#dc2626,#b91c1c)",
                                                                 color: "white" },
                                         }}
                                     >
