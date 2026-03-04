@@ -327,7 +327,7 @@ export default function CallPage({ initialToken }: Props) {
             const response = await createLink();
             const token = response?.token;
             if (!token) throw new Error("Token inválido");
-            const link = `${window.location.origin}/outbounds/call/${token}`;
+            const link = `${window.location.origin}/call/${token}`;
             setGeneratedToken(token);
             setGeneratedLink(link);
             await initializeCallink(token);
